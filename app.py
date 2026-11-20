@@ -13,6 +13,7 @@ import secrets
 import threading
 from collections import defaultdict
 from datetime import datetime
+from html import escape
 from itertools import combinations
 from pathlib import Path
 
@@ -30,7 +31,7 @@ SOLN_FILE = Path(os.environ.get('SOLN_FILE', DATA / 'SP27_synthetic_solution.csv
 COENROLL_FILE = Path(os.environ.get('COENROLL_FILE', DATA / 'SP27_coenroll_synthetic.csv'))
 PROPOSALS_FILE = Path(os.environ.get('PROPOSALS_FILE', HERE / 'proposals' / 'SP27_proposals.csv'))
 
-PAD_ROWS = 5  # empty '#' rows below the fullest slot, as in the Master sheet
+PAD_ROWS = 1  # empty rows below the fullest slot
 CONFLICT_ABS, CONFLICT_FRAC = 20, 0.15  # Master sheet conditional-format rule
 
 ACCESS_CODE = os.environ.get('ACCESS_CODE', 'FA2027')
@@ -128,14 +129,13 @@ def shared(a: str, b: str) -> int:
     return COENROLL.get(EXAMS[a], {}).get(EXAMS[b], 0)
 
 
-def clashes(eid: str, slot: str, assign: dict) -> dict[str, int]:
-    """Other exams in `slot` sharing students with `eid`."""
-    return {o: n for o, s in assign.items()
-            if s == slot and o != eid and (n := shared(eid, o))}
+def clashes(eid: str, others: list[str]) -> dict[str, int]:
+    """Exams in `others` (one slot's exams) sharing students with `eid`."""
+    return {o: n for o in others if o != eid and (n := shared(eid, o))}
 
 
-def conflict_count(eid: str, slot: str, assign: dict) -> int:
-    return sum(clashes(eid, slot, assign).values())
+def conflict_count(eid: str, others: list[str]) -> int:
+    return sum(clashes(eid, others).values())
 
 
 def total_conflicts(assign: dict) -> int:
@@ -155,11 +155,51 @@ def exam_name(eid: str) -> str:
 
 
 # ------------------------------------------------------------------- page
-CELL = 'px-2 py-0.5 border-r border-b border-gray-300 text-sm whitespace-nowrap'
-HEAD = f'{CELL} bg-gray-100 font-bold text-center'
-FLAG = 'bg-[#FFC7CE] text-[#9C0006]'
-DAY_EDGE = 'border-right: 3px double #9ca3af'  # stronger border closing each day's columns
 VIEWS = {'initial': 'Initial schedule', 'proposed': 'With proposed changes'}
+
+# The schedule is drawn as one HTML table (rather than one NiceGUI element per
+# cell) so a click sends a single update to the browser. Later rules win when
+# a cell has several backgrounds: column tint < exam highlight / red flag.
+GRID_CSS = '''
+.sched { border-collapse: separate; border-spacing: 0; font-size: .875rem;
+         border-left: 1px solid #d1d5db; border-top: 1px solid #d1d5db; }
+.sched td, .sched th { padding: 2px 8px; white-space: nowrap; font-weight: 400;
+         border-right: 1px solid #d1d5db; border-bottom: 1px solid #d1d5db; }
+.sched th, .sched .sum { background: #f3f4f6; }
+.sched th, .sched .rn { font-weight: 700; text-align: center; }
+.sched .ed { border-right: 3px double #9ca3af; }  /* closes each day's columns */
+.sched .r { text-align: right; }
+.sched .c { text-align: center; }
+.sched .ex, .sched.picking [data-s] { cursor: pointer; }
+.sched .dl { display: block; font-size: .75rem; font-weight: 400; }
+.sched .t0 { background: #dcfce7; }
+.sched .t1 { background: #fef2f2; }
+.sched .t2 { background: #fee2e2; }
+.sched .pr { background: #ddd6fe; }
+.sched .mv { background: #fde68a; }
+.sched .se { background: #2563eb; color: #fff; }
+.sched .fl { background: #FFC7CE; color: #9C0006; }
+'''
+
+# Clicks anywhere in the table: report the exam (if any) and slot index of the
+# cell under the pointer; cells outside a slot column have no data-s.
+GRID_CLICK_JS = '''(e) => {
+    const c = e.target.closest('[data-s]');
+    if (c) emit({exam: c.dataset.e || null, slot: Number(c.dataset.s)});
+}'''
+
+
+def td(text='', cls='', slot=None, exam=None, title=None, tag='td', span=None) -> str:
+    attrs = f' class="{cls}"' if cls else ''
+    if slot is not None:
+        attrs += f' data-s="{slot}"'
+    if exam is not None:
+        attrs += f' data-e="{escape(exam)}"'
+    if title:
+        attrs += f' title="{escape(title)}"'
+    if span:
+        attrs += f' colspan="{span}"'
+    return f'<{tag}{attrs}>{escape(str(text))}</{tag}>'
 
 
 def has_access() -> bool:
@@ -209,8 +249,15 @@ def index():
         return {e: (assign[e], s) for e, s in state['moves'].items() if s != assign[e]}
 
     def refresh():
-        grid.refresh()
+        table.content = grid_html()
         panel.refresh()
+
+    def on_grid_click(e):
+        exam, slot = e.args.get('exam'), e.args.get('slot')
+        if exam in EXAMS:
+            select(exam)
+        elif isinstance(slot, int) and 0 <= slot < len(SLOTS):
+            move_to(SLOTS[slot])
 
     def select(eid):
         state['selected'] = None if state['selected'] == eid else eid
@@ -251,8 +298,7 @@ def index():
         ui.notify(f'Proposal {pid} saved ({len(moves)} moves)', type='positive')
         reset()
 
-    @ui.refreshable
-    def grid():
+    def grid_html() -> str:
         assign, proposed_rows = base()
         trial, sel = trial_from(assign), state['selected']
         by_slot = defaultdict(list)
@@ -261,89 +307,75 @@ def index():
         for eids in by_slot.values():
             eids.sort()
         rows = max(BASE_ROWS, max(len(v) for v in by_slot.values()) + PAD_ROWS)
-        cur = conflict_count(sel, trial[sel], trial) if sel else 0
+        cur = conflict_count(sel, by_slot[trial[sel]]) if sel else 0
 
         # Per-slot what-if delta and column tint while an exam is selected
         delta, tint = {}, {}
         for s in SLOTS:
             if sel and s != trial[sel]:
-                delta[s] = conflict_count(sel, s, trial) - cur
-                tint[s] = ('bg-green-100' if delta[s] < 0 else
-                           '' if delta[s] == 0 else
-                           'bg-red-50' if delta[s] <= 10 else 'bg-red-100')
+                delta[s] = conflict_count(sel, by_slot[s]) - cur
+                tint[s] = ('t0' if delta[s] < 0 else '' if delta[s] == 0 else
+                           't1' if delta[s] <= 10 else 't2')
 
-        def cell(text, slot, classes='', on_click=None, end=False):
-            c = ui.label(str(text)).classes(f'{CELL} {tint.get(slot, "")} {classes}')
-            if end:
-                c.style(DAY_EDGE)
-            c.on('click.stop', on_click or (lambda s=slot: move_to(s)))
-            if sel:
-                c.classes('cursor-pointer')
-            return c
+        out = [f'<table class="sched{" picking" if sel else ""}">']
 
-        with ui.element('div').classes('w-full overflow-auto border-l border-t border-gray-300'):
-            with ui.grid(columns=f'auto repeat({len(SLOTS) * 3}, auto)').classes('gap-0 w-max'):
-                # Top header row: each date spans its Course / Enrollment / Conflicts columns
-                ui.label('').classes(HEAD).style(DAY_EDGE)
-                for s in SLOTS:
-                    with ui.element('div').classes(f'{HEAD} {tint.get(s, "")}').style(
-                            f'grid-column: span 3; {DAY_EDGE}') as h:
-                        ui.label(s)
-                        if s in delta:
-                            ui.label(f'{delta[s]:+d}').classes('text-xs font-normal')
-                    h.on('click', lambda s=s: move_to(s))
+        # Top header row: each date spans its Course / Enrollment / Conflicts columns
+        out.append('<tr>' + td(tag='th', cls='ed'))
+        for i, s in enumerate(SLOTS):
+            dl = f'<span class="dl">{delta[s]:+d}</span>' if s in delta else ''
+            out.append(f'<th class="ed {tint.get(s, "")}" colspan="3" data-s="{i}">'
+                       f'{escape(s)}{dl}</th>')
+        out.append('</tr>')
 
-                # Second header row: column labels within each date
-                ui.label('').classes(HEAD).style(DAY_EDGE)
-                for s in SLOTS:
-                    cell('Course', s, 'bg-gray-100 font-bold text-center')
-                    cell('Enrollment', s, 'bg-gray-100 font-bold text-center')
-                    cell('Conflicts', s, 'bg-gray-100 font-bold text-center', end=True)
+        # Second header row: column labels within each date
+        out.append('<tr>' + td(tag='th', cls='ed'))
+        for i, s in enumerate(SLOTS):
+            t = tint.get(s, '')
+            out.append(td('Course', t, i, tag='th') + td('Enrollment', t, i, tag='th')
+                       + td('Conflicts', f'ed {t}', i, tag='th'))
+        out.append('</tr>')
 
-                sums = {s: [0, 0] for s in SLOTS}
-                for i in range(rows):
-                    ui.label(str(i)).classes(f'{CELL} font-bold text-center').style(DAY_EDGE)
-                    for s in SLOTS:
-                        if i >= len(by_slot[s]):
-                            cell('', s)
-                            cell(0, s, 'text-right')
-                            cell('', s, end=True)
-                            continue
-                        eid = by_slot[s][i]
-                        course = EXAMS[eid]
-                        hl = ('bg-blue-600 text-white' if eid == sel else
-                              'bg-amber-200' if eid in state['moves'] else
-                              'bg-violet-200' if eid in proposed_rows else '')
-                        c = cell(course, s, f'{hl} cursor-pointer',
-                                 on_click=lambda e=eid: select(e))
-                        if eid in proposed_rows:
-                            r = proposed_rows[eid]
-                            with c, ui.tooltip():
-                                ui.label(f'Proposal {r["proposal_id"]} by {r["name"]}: '
-                                         f'{ASSIGNMENT[eid]} → {r["to_slot"]}')
-                        if course not in STUDENTS:
-                            cell(0, s, 'text-right')
-                            cell('NEW', s, 'text-center', end=True)
-                            continue
-                        students = STUDENTS[course]
-                        n = conflict_count(eid, s, trial)
-                        sums[s][0] += students
-                        sums[s][1] += n
-                        cell(students, s, 'text-right')
-                        c = cell(n, s, 'text-right' + (f' {FLAG}' if flagged(n, students) else ''),
-                                 end=True)
-                        if n:
-                            with c, ui.tooltip():
-                                for o, k in sorted(clashes(eid, s, trial).items(),
-                                                   key=lambda x: -x[1]):
-                                    ui.label(f'{EXAMS[o]}: {k}')
+        sums = {s: [0, 0] for s in SLOTS}
+        for row in range(rows):
+            out.append('<tr>' + td(row, 'rn ed'))
+            for i, s in enumerate(SLOTS):
+                t = tint.get(s, '')
+                if row >= len(by_slot[s]):
+                    out.append(td('', t, i) * 2 + td('', f'ed {t}', i))
+                    continue
+                eid = by_slot[s][row]
+                course = EXAMS[eid]
+                hl = ('se' if eid == sel else 'mv' if eid in state['moves'] else
+                      'pr' if eid in proposed_rows else '')
+                tip = None
+                if eid in proposed_rows:
+                    r = proposed_rows[eid]
+                    tip = (f'Proposal {r["proposal_id"]} by {r["name"]}: '
+                           f'{ASSIGNMENT[eid]} → {r["to_slot"]}')
+                out.append(td(course, f'ex {t} {hl}', i, exam=eid, title=tip))
+                if course not in STUDENTS:
+                    out.append(td(0, f'r {t}', i) + td('NEW', f'c ed {t}', i))
+                    continue
+                students = STUDENTS[course]
+                found = clashes(eid, by_slot[s])
+                n = sum(found.values())
+                sums[s][0] += students
+                sums[s][1] += n
+                tip = '\n'.join(f'{EXAMS[o]}: {k}' for o, k in
+                                sorted(found.items(), key=lambda x: -x[1]))
+                out.append(td(students, f'r {t}', i)
+                           + td(n, f'r ed {t}' + (' fl' if flagged(n, students) else ''),
+                                i, title=tip))
+            out.append('</tr>')
 
-                # Sum row (conflicts halved: each pair is counted from both sides)
-                ui.label(str(rows + 1)).classes(f'{CELL} font-bold text-center').style(DAY_EDGE)
-                for s in SLOTS:
-                    cell('Sum', s, 'bg-gray-100')
-                    cell(sums[s][0], s, 'bg-gray-100 text-right')
-                    cell(f'{sums[s][1] / 2:g}', s, 'bg-gray-100 text-right', end=True)
+        # Sum row (conflicts halved: each pair is counted from both sides)
+        out.append('<tr>' + td(rows + 1, 'rn ed'))
+        for i, s in enumerate(SLOTS):
+            t = tint.get(s, '')
+            out.append(td('Sum', f'sum {t}', i) + td(sums[s][0], f'sum r {t}', i)
+                       + td(f'{sums[s][1] / 2:g}', f'sum r ed {t}', i))
+        out.append('</tr></table>')
+        return ''.join(out)
 
     @ui.refreshable
     def panel():
@@ -374,13 +406,15 @@ def index():
             ui.button('Send proposal', on_click=submit).props('' if moves else 'disable')
             ui.button('Undo all', on_click=reset).props('flat')
 
+    ui.add_css(GRID_CSS)
     with ui.column().classes('w-full p-4 gap-4'):
         ui.toggle(VIEWS, value='initial', on_change=set_view)
         with ui.row().classes('items-start gap-6'):
             name = ui.input('NetID')
             with ui.column():
                 panel()
-        grid()
+        table = ui.html(grid_html()).classes('w-full overflow-auto')
+        table.on('click', on_grid_click, js_handler=GRID_CLICK_JS)
 
 
 # Local defaults; the hosted demo sets HOST=0.0.0.0, PORT=7860, RELOAD=0

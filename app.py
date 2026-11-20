@@ -34,7 +34,7 @@ PROPOSALS_FILE = Path(os.environ.get('PROPOSALS_FILE', HERE / 'proposals' / 'SP2
 PAD_ROWS = 1  # empty rows below the fullest slot
 CONFLICT_ABS, CONFLICT_FRAC = 20, 0.15  # Master sheet conditional-format rule
 
-ACCESS_CODE = os.environ.get('ACCESS_CODE', 'FA2027')
+ACCESS_CODE = os.environ.get('ACCESS_CODE', 'TEST')
 # Signs the browser cookie that remembers a correct code. A random secret
 # means everyone re-enters the code after a server restart; set
 # STORAGE_SECRET to keep people signed in across restarts.
@@ -189,14 +189,42 @@ GRID_CLICK_JS = '''(e) => {
 }'''
 
 
-def td(text='', cls='', slot=None, exam=None, title=None, tag='td', span=None) -> str:
+# Hover text for table cells with a data-tip attribute. One shared box with
+# fixed positioning, so it isn't clipped by the table's scroll area and shows
+# immediately (the browser's own title tooltips wait about a second).
+TOOLTIP_HTML = '''
+<div id="sched-tip" style="position: fixed; display: none; z-index: 1000; pointer-events: none;
+     background: #374151; color: #fff; font-size: .8rem; padding: 4px 8px; border-radius: 4px;
+     white-space: pre-line; max-width: 320px;"></div>
+<script>
+(() => {
+  const tip = () => document.getElementById('sched-tip');
+  const hide = () => { tip().style.display = 'none'; };
+  document.addEventListener('mouseover', (e) => {
+    const cell = e.target.closest('.sched [data-tip]');
+    if (!cell) return hide();
+    const t = tip();
+    t.textContent = cell.dataset.tip;
+    t.style.display = 'block';
+    const r = cell.getBoundingClientRect(), w = t.offsetWidth, h = t.offsetHeight;
+    t.style.left = Math.max(4, Math.min(r.left, innerWidth - w - 4)) + 'px';
+    t.style.top = (r.bottom + h + 4 > innerHeight ? r.top - h - 4 : r.bottom + 4) + 'px';
+  });
+  document.addEventListener('scroll', hide, true);
+  document.addEventListener('click', hide);
+})();
+</script>
+'''
+
+
+def td(text='', cls='', slot=None, exam=None, tip=None, tag='td', span=None) -> str:
     attrs = f' class="{cls}"' if cls else ''
     if slot is not None:
         attrs += f' data-s="{slot}"'
     if exam is not None:
         attrs += f' data-e="{escape(exam)}"'
-    if title:
-        attrs += f' title="{escape(title)}"'
+    if tip:
+        attrs += f' data-tip="{escape(tip)}"'
     if span:
         attrs += f' colspan="{span}"'
     return f'<{tag}{attrs}>{escape(str(text))}</{tag}>'
@@ -352,7 +380,7 @@ def index():
                     r = proposed_rows[eid]
                     tip = (f'Proposal {r["proposal_id"]} by {r["name"]}: '
                            f'{ASSIGNMENT[eid]} → {r["to_slot"]}')
-                out.append(td(course, f'ex {t} {hl}', i, exam=eid, title=tip))
+                out.append(td(course, f'ex {t} {hl}', i, exam=eid, tip=tip))
                 if course not in STUDENTS:
                     out.append(td(0, f'r {t}', i) + td('NEW', f'c ed {t}', i))
                     continue
@@ -365,7 +393,7 @@ def index():
                                 sorted(found.items(), key=lambda x: -x[1]))
                 out.append(td(students, f'r {t}', i)
                            + td(n, f'r ed {t}' + (' fl' if flagged(n, students) else ''),
-                                i, title=tip))
+                                i, tip=tip))
             out.append('</tr>')
 
         # Sum row (conflicts halved: each pair is counted from both sides)
@@ -379,40 +407,45 @@ def index():
 
     @ui.refreshable
     def panel():
+        """Conflict totals, instructions and this user's pending moves"""
         assign, proposed_rows = base()
         trial, sel = trial_from(assign), state['selected']
         moves = changes(assign)
+        send.set_enabled(bool(moves))
         initial, current, after = (total_conflicts(ASSIGNMENT), total_conflicts(assign),
                                    total_conflicts(trial))
         if state['view'] == 'proposed':
             n_props = len({r['proposal_id'] for r in load_proposals()})
-            ui.label(f'Total conflicts: {initial} initially, {current} with '
-                     f'{n_props} submitted proposal(s), {after} with your changes'
-                     ).classes('font-semibold')
-            ui.label(f'{len(proposed_rows)} exam(s) moved by proposals (purple).'
-                     ).classes('text-sm')
+            totals = (f'Total conflicts: {initial} initially, {current} with {n_props} '
+                      f'submitted proposal(s), {after} with your changes')
+            hint = f'{len(proposed_rows)} exam(s) moved by proposals (purple). '
         else:
-            ui.label(f'Total conflicts: {current} now, {after} with your changes'
-                     ).classes('font-semibold')
+            totals = f'Total conflicts: {current} now, {after} with your changes'
+            hint = ''
         if sel:
-            course = EXAMS[sel]
-            ui.label(f'Moving {exam_name(sel)}, {STUDENTS.get(course, "NEW")} students. '
-                     'Click a slot: green lowers conflicts, red raises them.')
-        else:
-            ui.label('Click an exam to see where it could go.')
-        for eid, (old, new) in moves.items():
-            ui.label(f'{exam_name(eid)}: {old} → {new}').classes('text-sm')
-        with ui.row():
-            ui.button('Send proposal', on_click=submit).props('' if moves else 'disable')
-            ui.button('Undo all', on_click=reset).props('flat')
+            hint += f'Moving {exam_name(sel)}, {STUDENTS.get(EXAMS[sel], "NEW")} students.'
+        with ui.column().classes('gap-0'):
+            ui.label(totals).classes('font-semibold')
+            if hint:
+                ui.label(hint).classes('text-sm')
+            if moves:
+                ui.label('Your changes: ' + '; '.join(
+                    f'{exam_name(e)}: {old} → {new}' for e, (old, new) in moves.items()
+                )).classes('text-sm')
 
     ui.add_css(GRID_CSS)
-    with ui.column().classes('w-full p-4 gap-4'):
-        ui.toggle(VIEWS, value='initial', on_change=set_view)
-        with ui.row().classes('items-start gap-6'):
-            name = ui.input('NetID')
-            with ui.column():
-                panel()
+    ui.add_body_html(TOOLTIP_HTML)
+    with ui.column().classes('w-full px-4 py-2 gap-2'):
+        # One toolbar row (wraps on narrow screens) to leave room for the schedule
+        with ui.row().classes('w-full items-center gap-x-6 gap-y-2'):
+            ui.toggle(VIEWS, value='initial', on_change=set_view).props('dense')
+            panel_box = ui.element('div').classes('flex-1 min-w-64')
+            with ui.row().classes('items-center gap-2'):
+                name = ui.input('NetID').props('dense outlined').classes('w-32')
+                send = ui.button('Send proposal', on_click=submit)
+                ui.button('Undo all', on_click=reset).props('flat')
+        with panel_box:
+            panel()
         table = ui.html(grid_html()).classes('w-full overflow-auto')
         table.on('click', on_grid_click, js_handler=GRID_CLICK_JS)
 
